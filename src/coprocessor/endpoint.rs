@@ -6,7 +6,8 @@ use std::{
 };
 
 use ::tracker::{
-    GLOBAL_TRACKERS, RequestInfo, RequestType, set_tls_tracker_token, track, with_tls_tracker,
+    GLOBAL_TRACKERS, RequestInfo, RequestType, TrackerToken, get_tls_tracker_token,
+    set_tls_tracker_token, track, with_tls_tracker,
 };
 use anyhow::anyhow;
 use api_version::{KvFormat, dispatch_api_version};
@@ -65,6 +66,85 @@ use crate::{
 /// light ones, which means they don't need a permit from the semaphore before
 /// execution.
 const LIGHT_TASK_THRESHOLD: Duration = Duration::from_millis(5);
+
+/// Records the size of response data attributed to the request tracked by
+/// `tracker`. The token is explicit because mergeable results are serialized
+/// outside the read pool, where TLS may belong to another request.
+fn record_coprocessor_response_size(resp_size: u64, tracker: TrackerToken) {
+    COPR_RESP_SIZE.inc_by(resp_size);
+    record_network_out_bytes(resp_size);
+    GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+        tracker.metrics.coprocessor_response_bytes = tracker
+            .metrics
+            .coprocessor_response_bytes
+            .saturating_add(resp_size);
+    });
+}
+
+fn serialize_mergeable_result(
+    result: Box<dyn MergeableResult>,
+    tracker: TrackerToken,
+) -> Result<Vec<u8>> {
+    let data = result.into_data()?;
+    record_coprocessor_response_size(data.len() as u64, tracker);
+    Ok(data)
+}
+
+type HandlerOutput = MemoryTraceGuard<HandlerOutcome>;
+
+struct BatchTaskOutput {
+    response: coppb::StoreBatchTaskResponse,
+    mergeable_result: Option<Box<dyn MergeableResult>>,
+}
+
+fn resolve_handler_outcome(outcome: HandlerOutcome, tracker: TrackerToken) -> coppb::Response {
+    match outcome {
+        HandlerOutcome::Ready(response) => response,
+        HandlerOutcome::Mergeable {
+            mut partial_response,
+            result,
+        } => {
+            debug_assert!(partial_response.get_data().is_empty());
+            match serialize_mergeable_result(result, tracker) {
+                Ok(data) => partial_response.set_data(data),
+                Err(e) => return make_error_response(e),
+            }
+            partial_response
+        }
+    }
+}
+
+fn resolve_batch_task_output(
+    mut output: BatchTaskOutput,
+    tracker: TrackerToken,
+) -> coppb::StoreBatchTaskResponse {
+    if let Some(mergeable) = output.mergeable_result {
+        match serialize_mergeable_result(mergeable, tracker) {
+            Ok(data) => output.response.set_data(data),
+            Err(e) => make_error_batch_response(&mut output.response, e),
+        }
+    }
+    output.response
+}
+
+fn attach_batch_task_responses(
+    output: HandlerOutput,
+    batch_outputs: Vec<BatchTaskOutput>,
+    tracker: TrackerToken,
+) -> MemoryTraceGuard<coppb::Response> {
+    let mut resp = output.map(|outcome| {
+        let mut response = resolve_handler_outcome(outcome, tracker);
+        let batch_responses = batch_outputs
+            .into_iter()
+            .map(|output| resolve_batch_task_output(output, tracker))
+            .collect::<Vec<_>>();
+        response.set_batch_responses(batch_responses.into());
+        response
+    });
+    let data_len = resp.get_data().len();
+    resp.retrace(data_len);
+    resp
+}
 
 /// A pool to build and run Coprocessor request handlers.
 #[derive(Clone)]
@@ -483,7 +563,7 @@ impl<E: Engine> Endpoint<E> {
         semaphore: Option<Arc<Semaphore>>,
         mut tracker: Box<Tracker<E>>,
         handler_builder: RequestHandlerBuilder<E::IMSnap>,
-    ) -> Result<MemoryTraceGuard<coppb::Response>> {
+    ) -> Result<HandlerOutput> {
         with_tls_tracker(|tracker1| {
             record_network_in_bytes(tracker1.metrics.grpc_req_size);
         });
@@ -551,21 +631,15 @@ impl<E: Engine> Endpoint<E> {
         let mut storage_stats = Statistics::default();
         handler.collect_scan_statistics(&mut storage_stats);
         tracker.collect_storage_statistics(storage_stats);
-        let mut resp = match result {
-            Ok(output) => {
-                let resp = output.map(|outcome| match outcome {
-                    HandlerOutcome::Ready(resp) => resp,
-                });
-                let resp_size = resp.data.len() as u64;
-                COPR_RESP_SIZE.inc_by(resp_size);
-                record_network_out_bytes(resp_size);
-                with_tls_tracker(|tracker| {
-                    tracker.metrics.coprocessor_response_bytes = tracker
-                        .metrics
-                        .coprocessor_response_bytes
-                        .saturating_add(resp_size);
-                });
-                resp
+        let mut resp: HandlerOutput = match result {
+            Ok(outcome) => {
+                // A `Mergeable` outcome carries no data yet; its size is
+                // recorded when the merged result is serialized.
+                record_coprocessor_response_size(
+                    outcome.response().get_data().len() as u64,
+                    get_tls_tracker_token(),
+                );
+                outcome
             }
             Err(e) => {
                 if let Error::DefaultNotFound(errmsg) = &e {
@@ -574,15 +648,16 @@ impl<E: Engine> Endpoint<E> {
                         "reqCtx" => ?&tracker.req_ctx,
                     );
                 }
-                make_error_response(e).into()
+                HandlerOutcome::Ready(make_error_response(e)).into()
             }
         };
         let (exec_details, exec_details_v2) = tracker.get_exec_details();
         tracker.on_finish_all_items();
         record_logical_read_bytes(exec_details_v2.get_scan_detail_v2().processed_versions_size);
-        resp.set_exec_details(exec_details);
-        resp.set_exec_details_v2(exec_details_v2);
-        resp.set_latest_buckets_version(buckets_version);
+        let response = resp.response_mut();
+        response.set_exec_details(exec_details);
+        response.set_exec_details_v2(exec_details_v2);
+        response.set_latest_buckets_version(buckets_version);
         Ok(resp)
     }
 
@@ -593,7 +668,7 @@ impl<E: Engine> Endpoint<E> {
     fn handle_unary_request(
         &self,
         r: ParseCopRequestResult<E::IMSnap>,
-    ) -> impl Future<Output = Result<MemoryTraceGuard<coppb::Response>>> {
+    ) -> impl Future<Output = Result<HandlerOutput>> {
         let req_ctx = r.req_ctx;
         let priority = req_ctx.context.get_priority();
         let task_id = req_ctx.build_task_id();
@@ -671,7 +746,7 @@ impl<E: Engine> Endpoint<E> {
             return Either::Left(async move { resp.into() });
         }
 
-        let result_of_batch = self.process_batch_tasks(&mut req, &peer);
+        let batch_outputs = self.process_batch_tasks(&mut req, &peer);
         set_tls_tracker_token(tracker);
         with_tls_tracker(|tracker| {
             tracker.metrics.grpc_req_size = req.compute_size() as u64;
@@ -684,17 +759,16 @@ impl<E: Engine> Endpoint<E> {
                 tracker.req_info.begin.saturating_elapsed().as_nanos() as u64;
         });
         let fut = async move {
-            let res = match result_of_future {
+            let mut res = match result_of_future {
                 Err(e) => {
-                    let mut res = make_error_response(e);
-                    let batch_res = result_of_batch.await;
-                    res.set_batch_responses(batch_res.into());
-                    res.into()
+                    let output = HandlerOutcome::Ready(make_error_response(e)).into();
+                    attach_batch_task_responses(output, batch_outputs.await, tracker)
                 }
                 Ok(handle_fut) => {
-                    let (handle_res, batch_res) = futures::join!(handle_fut, result_of_batch);
-                    let mut res = handle_res.unwrap_or_else(|e| make_error_response(e).into());
-                    res.set_batch_responses(batch_res.into());
+                    let (handle_res, batch_outputs) = futures::join!(handle_fut, batch_outputs);
+                    let output = handle_res
+                        .unwrap_or_else(|e| HandlerOutcome::Ready(make_error_response(e)).into());
+                    let mut res = attach_batch_task_responses(output, batch_outputs, tracker);
                     GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
                         let exec_detail_v2 = res.mut_exec_details_v2();
                         tracker.write_scan_detail(exec_detail_v2.mut_scan_detail_v2());
@@ -703,21 +777,25 @@ impl<E: Engine> Endpoint<E> {
                     res
                 }
             };
+            // Attaching serializes mergeable data outside the read pool.
+            GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+                res.mut_exec_details_v2()
+                    .mut_ru_v2()
+                    .set_coprocessor_response_bytes(tracker.metrics.coprocessor_response_bytes);
+            });
             GLOBAL_TRACKERS.remove(tracker);
             res
         };
         Either::Right(fut)
     }
 
-    // process_batch_tasks process the input batched coprocessor tasks if any,
-    // prepare all the requests and schedule them into the read pool, then
-    // collect all the responses and convert them into the `StoreBatchResponse`
-    // type.
-    pub fn process_batch_tasks(
+    // Schedule all batched coprocessor tasks in the read pool and collect
+    // their still-unserialized outputs for endpoint resolution.
+    fn process_batch_tasks(
         &self,
         req: &mut coppb::Request,
         peer: &Option<String>,
-    ) -> impl Future<Output = Vec<coppb::StoreBatchTaskResponse>> {
+    ) -> impl Future<Output = Vec<BatchTaskOutput>> {
         let mut batch_futs = Vec::with_capacity(req.tasks.len());
         let batch_reqs: Vec<(coppb::Request, u64)> = req
             .take_tasks()
@@ -750,8 +828,19 @@ impl<E: Engine> Endpoint<E> {
                     let fut = self.handle_unary_request(r);
                     let fut = async move {
                         let res = fut.await;
+                        let mut mergeable_result = None;
                         match res {
-                            Ok(mut resp) => {
+                            Ok(mut output) => {
+                                let mut resp = match output.consume() {
+                                    HandlerOutcome::Ready(response) => response,
+                                    HandlerOutcome::Mergeable {
+                                        partial_response,
+                                        result,
+                                    } => {
+                                        mergeable_result = Some(result);
+                                        partial_response
+                                    }
+                                };
                                 response.set_data(resp.take_data());
                                 if let Some(err) = resp.region_error.take() {
                                     response.set_region_error(err);
@@ -773,14 +862,20 @@ impl<E: Engine> Endpoint<E> {
                             }
                         }
                         GLOBAL_TRACKERS.remove(cur_tracker);
-                        response
+                        BatchTaskOutput {
+                            response,
+                            mergeable_result,
+                        }
                     };
 
                     batch_futs.push(future::Either::Left(fut));
                 }
                 Err(e) => batch_futs.push(future::Either::Right(async move {
                     make_error_batch_response(&mut response, e);
-                    response
+                    BatchTaskOutput {
+                        response,
+                        mergeable_result: None,
+                    }
                 })),
             }
         }
@@ -1362,6 +1457,15 @@ mod tests {
         }
     }
 
+    /// Resolves the output of `handle_unary_request` into its response,
+    /// which must be ready.
+    fn unwrap_ready(output: HandlerOutput) -> MemoryTraceGuard<coppb::Response> {
+        output.map(|outcome| match outcome {
+            HandlerOutcome::Ready(response) => response,
+            HandlerOutcome::Mergeable { .. } => panic!("expected a ready response"),
+        })
+    }
+
     /// A streaming `RequestHandler` that always produces a fixture.
     struct StreamFixture {
         result_len: usize,
@@ -1470,10 +1574,12 @@ mod tests {
         // a normal request
         let handler_builder =
             Box::new(|_, _: &_| Ok(UnaryFixture::new(Ok(coppb::Response::default())).into_boxed()));
-        let resp = block_on(
-            copr.handle_unary_request(ParseCopRequestResult::default_for_test(handler_builder)),
-        )
-        .unwrap();
+        let resp = unwrap_ready(
+            block_on(
+                copr.handle_unary_request(ParseCopRequestResult::default_for_test(handler_builder)),
+            )
+            .unwrap(),
+        );
         assert!(resp.get_other_error().is_empty());
 
         // an outdated request
@@ -1657,7 +1763,7 @@ mod tests {
             rx.recv().unwrap().unwrap_err();
         }
         for i in 0..2 {
-            let resp = rx.recv().unwrap().unwrap();
+            let resp = unwrap_ready(rx.recv().unwrap().unwrap());
             assert_eq!(resp.get_data(), [1, 2, i]);
             assert!(!resp.has_region_error());
         }
@@ -1682,10 +1788,12 @@ mod tests {
 
         let handler_builder =
             Box::new(|_, _: &_| Ok(UnaryFixture::new(Err(box_err!("foo"))).into_boxed()));
-        let resp = block_on(
-            copr.handle_unary_request(ParseCopRequestResult::default_for_test(handler_builder)),
-        )
-        .unwrap();
+        let resp = unwrap_ready(
+            block_on(
+                copr.handle_unary_request(ParseCopRequestResult::default_for_test(handler_builder)),
+            )
+            .unwrap(),
+        );
         assert_eq!(resp.get_data().len(), 0);
         assert!(!resp.get_other_error().is_empty());
     }
@@ -1726,10 +1834,12 @@ mod tests {
             response.set_data(vec![1, 2, 3, 4]);
             Ok(UnaryFixture::new(Ok(response)).into_boxed())
         });
-        let resp = block_on(
-            copr.handle_unary_request(ParseCopRequestResult::default_for_test(handler_builder)),
-        )
-        .unwrap();
+        let resp = unwrap_ready(
+            block_on(
+                copr.handle_unary_request(ParseCopRequestResult::default_for_test(handler_builder)),
+            )
+            .unwrap(),
+        );
 
         assert_eq!(
             resp.get_exec_details_v2()
@@ -2036,7 +2146,11 @@ mod tests {
                 handler_builder,
             });
             let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());
+            thread::spawn(move || {
+                sender
+                    .send(vec![unwrap_ready(block_on(resp_future_1).unwrap())])
+                    .unwrap()
+            });
             // Sleep a while to make sure that thread is spawn and snapshot is taken.
             thread::sleep(SNAPSHOT_DURATION);
 
@@ -2053,7 +2167,11 @@ mod tests {
                 handler_builder,
             });
             let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_2).unwrap()]).unwrap());
+            thread::spawn(move || {
+                sender
+                    .send(vec![unwrap_ready(block_on(resp_future_2).unwrap())])
+                    .unwrap()
+            });
             thread::sleep(SNAPSHOT_DURATION);
 
             // Response 1
@@ -2162,7 +2280,11 @@ mod tests {
                 handler_builder,
             });
             let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());
+            thread::spawn(move || {
+                sender
+                    .send(vec![unwrap_ready(block_on(resp_future_1).unwrap())])
+                    .unwrap()
+            });
             // Sleep a while to make sure that thread is spawn and snapshot is taken.
             thread::sleep(SNAPSHOT_DURATION);
 
@@ -2179,7 +2301,11 @@ mod tests {
                 handler_builder,
             });
             let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_2).unwrap()]).unwrap());
+            thread::spawn(move || {
+                sender
+                    .send(vec![unwrap_ready(block_on(resp_future_2).unwrap())])
+                    .unwrap()
+            });
             thread::sleep(SNAPSHOT_DURATION);
 
             // Response 1
@@ -2245,7 +2371,11 @@ mod tests {
                 handler_builder,
             });
             let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());
+            thread::spawn(move || {
+                sender
+                    .send(vec![unwrap_ready(block_on(resp_future_1).unwrap())])
+                    .unwrap()
+            });
             // Sleep a while to make sure that thread is spawn and snapshot is taken.
             thread::sleep(SNAPSHOT_DURATION);
 
@@ -2423,12 +2553,14 @@ mod tests {
             inner.deadline = Deadline::from_now(Duration::from_millis(500));
             let config: ReqContext = inner.into();
 
-            let resp = block_on(copr.handle_unary_request(ParseCopRequestResult {
-                req_tag: ReqTag::test,
-                req_ctx: config,
-                handler_builder,
-            }))
-            .unwrap();
+            let resp = unwrap_ready(
+                block_on(copr.handle_unary_request(ParseCopRequestResult {
+                    req_tag: ReqTag::test,
+                    req_ctx: config,
+                    handler_builder,
+                }))
+                .unwrap(),
+            );
             assert_eq!(resp.get_data().len(), 0);
             let region_err = resp.get_region_error();
             assert_eq!(
@@ -2450,12 +2582,14 @@ mod tests {
             inner.deadline = Deadline::from_now(Duration::from_millis(500));
             let config: ReqContext = inner.into();
 
-            let resp = block_on(copr.handle_unary_request(ParseCopRequestResult {
-                req_tag: ReqTag::test,
-                req_ctx: config,
-                handler_builder,
-            }))
-            .unwrap();
+            let resp = unwrap_ready(
+                block_on(copr.handle_unary_request(ParseCopRequestResult {
+                    req_tag: ReqTag::test,
+                    req_ctx: config,
+                    handler_builder,
+                }))
+                .unwrap(),
+            );
             assert_eq!(resp.get_data().len(), 0);
             let region_err = resp.get_region_error();
             assert_eq!(
@@ -2649,12 +2783,14 @@ mod tests {
             inner.deadline = Deadline::from_now(Duration::from_millis(500));
             let config: ReqContext = inner.into();
 
-            let resp = block_on(copr.handle_unary_request(ParseCopRequestResult {
-                req_tag: ReqTag::test,
-                req_ctx: config,
-                handler_builder,
-            }))
-            .unwrap();
+            let resp = unwrap_ready(
+                block_on(copr.handle_unary_request(ParseCopRequestResult {
+                    req_tag: ReqTag::test,
+                    req_ctx: config,
+                    handler_builder,
+                }))
+                .unwrap(),
+            );
             assert!(!resp.has_region_error(), "{:?}", resp);
         }
 

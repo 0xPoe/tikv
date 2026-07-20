@@ -75,9 +75,17 @@ pub trait MergeableResult: Any + Send {
     fn into_data(self: Box<Self>) -> Result<Vec<u8>>;
 }
 
-/// The outcome of handling a unary request.
+/// The outcome of handling a unary request: either a response that is ready
+/// to return, or a partial response whose data remains unserialized so the
+/// endpoint can decide how to resolve it.
 pub enum HandlerOutcome {
     Ready(coppb::Response),
+    Mergeable {
+        /// The response carrying everything but data; data is produced from
+        /// `result` when the endpoint resolves the outcome.
+        partial_response: coppb::Response,
+        result: Box<dyn MergeableResult>,
+    },
 }
 
 // `MemoryTraceGuard<T>` requires `T: Default`.
@@ -87,10 +95,33 @@ impl Default for HandlerOutcome {
     }
 }
 
+impl HandlerOutcome {
+    pub fn response(&self) -> &coppb::Response {
+        match self {
+            Self::Ready(response)
+            | Self::Mergeable {
+                partial_response: response,
+                ..
+            } => response,
+        }
+    }
+
+    pub fn response_mut(&mut self) -> &mut coppb::Response {
+        match self {
+            Self::Ready(response)
+            | Self::Mergeable {
+                partial_response: response,
+                ..
+            } => response,
+        }
+    }
+}
+
 /// An interface for all kind of Coprocessor request handlers.
 #[async_trait]
 pub trait RequestHandler: Send {
-    /// Processes current request and produces an outcome.
+    /// Processes current request and produces an outcome for the endpoint to
+    /// resolve.
     async fn handle_request(&mut self) -> Result<MemoryTraceGuard<HandlerOutcome>> {
         panic!("unary request is not supported for this handler");
     }
