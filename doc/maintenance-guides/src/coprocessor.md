@@ -57,6 +57,39 @@ It is a read-heavy hot path and directly impacts query latency.
 - Cache-match version, flashback allowance, and lock-bypass/access sets are all
   correctness-sensitive metadata, not optional optimization flags.
 
+### Handler outcomes and batched-task merging
+
+- `RequestHandler::handle_request` returns a `HandlerOutcome`; today only
+  full-sampling analyze opts into the `Mergeable` outcome
+  (`statistics/analyze_context.rs`).
+- `endpoint.rs::attach_batch_task_responses` resolves every outcome into the
+  final response. Merging happens only when the client allows it
+  (`Request.allow_batch_task_data_merge`) and the top task kept an error-free
+  mergeable result. Each error-free batched task with a mergeable result of
+  the same concrete type is merged as it completes (checked via `TypeId`; a
+  mismatch is a handler bug — debug builds assert, release builds keep that
+  task unmerged). Merge implementations must therefore be logically
+  order-independent. Batch responses follow task completion order on the wire.
+- Wire contract: the top response carries its result merged with every
+  eligible successful batched task. Each merged task is acknowledged by a
+  data-less batch response with `data_merged_into_response` set and keeps its
+  execution details; failed or non-mergeable tasks keep normal batch
+  responses so the client can retry or consume them independently. Clients
+  that never set the request field keep receiving one response per task.
+- `process_batch_tasks` streams outputs in completion order instead of
+  collecting every unserialized result. Once the top result is available,
+  successful child collectors are merged and released immediately, reducing
+  normal peak memory to the accumulator plus unresolved outputs. Results that
+  finish before the top task may still queue, so this is not a strict memory
+  bound.
+- If serializing a result after consuming any batched result fails, the
+  endpoint returns neither partial data nor task acknowledgements, so a retry
+  cannot lose or double-count data.
+- The canonical contracts (merge order, downcast safety, memory and metrics
+  accounting) live on `HandlerOutcome`/`MergeableResult` in
+  `src/coprocessor/mod.rs` and on `process_batch_tasks`/
+  `attach_batch_task_responses` in `src/coprocessor/endpoint.rs`.
+
 ## Start Here
 
 - `src/coprocessor/mod.rs`
@@ -97,6 +130,8 @@ It is a read-heavy hot path and directly impacts query latency.
 - Memory quota and concurrency limiters must remain cheap and correct.
 - Streaming and unary response handling must preserve stats and partial-progress
   semantics.
+- Merged batched responses must keep the wire contract described in
+  "Handler outcomes and batched-task merging".
 
 ## Observability And Operational Signals
 

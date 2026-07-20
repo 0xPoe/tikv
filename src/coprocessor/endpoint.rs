@@ -67,9 +67,14 @@ use crate::{
 /// execution.
 const LIGHT_TASK_THRESHOLD: Duration = Duration::from_millis(5);
 
+fn response_has_error(resp: &coppb::Response) -> bool {
+    resp.has_region_error() || resp.has_locked() || !resp.get_other_error().is_empty()
+}
+
 /// Records the size of response data attributed to the request tracked by
-/// `tracker`. The token is explicit because mergeable results are serialized
-/// outside the read pool, where TLS may belong to another request.
+/// `tracker`. The token is passed explicitly because response data may be
+/// serialized outside the read pool (see `serialize_mergeable_result`),
+/// where the thread local tracker belongs to another request.
 fn record_coprocessor_response_size(resp_size: u64, tracker: TrackerToken) {
     COPR_RESP_SIZE.inc_by(resp_size);
     record_network_out_bytes(resp_size);
@@ -81,6 +86,12 @@ fn record_coprocessor_response_size(resp_size: u64, tracker: TrackerToken) {
     });
 }
 
+fn batch_response_has_error(resp: &coppb::StoreBatchTaskResponse) -> bool {
+    resp.has_region_error() || resp.has_locked() || !resp.get_other_error().is_empty()
+}
+
+/// Serializes the mergeable result of a task into response data, recording
+/// its size against the request tracked by `tracker`.
 fn serialize_mergeable_result(
     result: Box<dyn MergeableResult>,
     tracker: TrackerToken,
@@ -92,26 +103,84 @@ fn serialize_mergeable_result(
 
 type HandlerOutput = MemoryTraceGuard<HandlerOutcome>;
 
+/// The output of handling one batched task of the request: the task's
+/// response plus, when the handler produced a `Mergeable` outcome, its
+/// still-unserialized result.
+///
+/// When `mergeable_result` is `Some`, `response` carries no data; the
+/// task's data lives in the result until `attach_batch_task_responses`
+/// either merges it into the top response or serializes it into
+/// `response`. Unlike `HandlerOutput` this carries no memory trace guard:
+/// the task's guard is consumed in `process_batch_tasks` and the
+/// serialized data is re-accounted by the top task's guard.
 struct BatchTaskOutput {
     response: coppb::StoreBatchTaskResponse,
     mergeable_result: Option<Box<dyn MergeableResult>>,
 }
 
-fn resolve_handler_outcome(outcome: HandlerOutcome, tracker: TrackerToken) -> coppb::Response {
-    match outcome {
-        HandlerOutcome::Ready(response) => response,
+/// Consumes batched task outputs as they become ready and attaches them to
+/// the top task's response. `tracker` is the top task's token, which owns the
+/// response bytes serialized here; the batched tasks' trackers are already
+/// gone.
+///
+/// When merging is allowed and the top task kept an error-free mergeable
+/// result, each compatible successful child result is merged immediately and
+/// dropped. Only its data-less acknowledgement and execution details remain.
+/// Other outputs are retained for normal per-task serialization. Batch
+/// responses follow task completion order.
+async fn attach_batch_task_responses(
+    mut output: HandlerOutput,
+    batch_outputs: impl Stream<Item = BatchTaskOutput>,
+    tracker: TrackerToken,
+    allow_merge: bool,
+) -> MemoryTraceGuard<coppb::Response> {
+    let merge_type_id = match &*output {
         HandlerOutcome::Mergeable {
-            mut partial_response,
+            partial_response,
             result,
-        } => {
-            debug_assert!(partial_response.get_data().is_empty());
-            match serialize_mergeable_result(result, tracker) {
-                Ok(data) => partial_response.set_data(data),
-                Err(e) => return make_error_response(e),
-            }
-            partial_response
+        } if allow_merge && !response_has_error(partial_response) => Some((**result).type_id()),
+        _ => None,
+    };
+    let mut merged_batch_result = false;
+    let mut completed_outputs = Vec::new();
+
+    futures::pin_mut!(batch_outputs);
+    while let Some(mut batch_output) = batch_outputs.next().await {
+        let can_merge = merge_type_id.is_some_and(|type_id| {
+            !batch_response_has_error(&batch_output.response)
+                && batch_output
+                    .mergeable_result
+                    .as_ref()
+                    .is_some_and(|mergeable| {
+                        // The results of one request always have the same
+                        // concrete type. A mismatch is a handler bug; release
+                        // builds keep that result unmerged.
+                        let same_type = (**mergeable).type_id() == type_id;
+                        debug_assert!(same_type, "results of one request have the same type");
+                        same_type
+                    })
+        });
+        if can_merge {
+            debug_assert!(batch_output.response.get_data().is_empty());
+            let HandlerOutcome::Mergeable { result: merged, .. } = &mut *output else {
+                unreachable!("a merge type exists only for a mergeable top result");
+            };
+            merged.merge(batch_output.mergeable_result.take().unwrap());
+            batch_output.response.set_data_merged_into_response(true);
+            merged_batch_result = true;
         }
+
+        completed_outputs.push(batch_output);
     }
+
+    let mut resp = output.map(|outcome| {
+        build_batched_response(outcome, completed_outputs, tracker, merged_batch_result)
+    });
+    // A `Mergeable` outcome is traced before its result is serialized;
+    // account the serialized data now that the response carries it.
+    let data_len = resp.get_data().len();
+    resp.retrace(data_len);
+    resp
 }
 
 fn resolve_batch_task_output(
@@ -127,23 +196,46 @@ fn resolve_batch_task_output(
     output.response
 }
 
-fn attach_batch_task_responses(
-    output: HandlerOutput,
+fn attach_batch_outputs(
+    mut response: coppb::Response,
     batch_outputs: Vec<BatchTaskOutput>,
     tracker: TrackerToken,
-) -> MemoryTraceGuard<coppb::Response> {
-    let mut resp = output.map(|outcome| {
-        let mut response = resolve_handler_outcome(outcome, tracker);
-        let batch_responses = batch_outputs
-            .into_iter()
-            .map(|output| resolve_batch_task_output(output, tracker))
-            .collect::<Vec<_>>();
-        response.set_batch_responses(batch_responses.into());
-        response
-    });
-    let data_len = resp.get_data().len();
-    resp.retrace(data_len);
-    resp
+) -> coppb::Response {
+    let batch_responses = batch_outputs
+        .into_iter()
+        .map(|output| resolve_batch_task_output(output, tracker))
+        .collect::<Vec<_>>();
+    response.set_batch_responses(batch_responses.into());
+    response
+}
+
+fn build_batched_response(
+    outcome: HandlerOutcome,
+    batch_outputs: Vec<BatchTaskOutput>,
+    tracker: TrackerToken,
+    merged_batch_result: bool,
+) -> coppb::Response {
+    let response = match outcome {
+        HandlerOutcome::Ready(response) => response,
+        HandlerOutcome::Mergeable {
+            mut partial_response,
+            result,
+        } => {
+            debug_assert!(partial_response.get_data().is_empty());
+            match serialize_mergeable_result(result, tracker) {
+                Ok(data) => {
+                    partial_response.set_data(data);
+                    partial_response
+                }
+                // Once a child result has been merged it cannot be recovered
+                // for an individual response. Return no acknowledgements or
+                // partial data so a retry cannot lose or double-count results.
+                Err(e) if merged_batch_result => return make_error_response(e),
+                Err(e) => make_error_response(e),
+            }
+        }
+    };
+    attach_batch_outputs(response, batch_outputs, tracker)
 }
 
 /// A pool to build and run Coprocessor request handlers.
@@ -746,6 +838,7 @@ impl<E: Engine> Endpoint<E> {
             return Either::Left(async move { resp.into() });
         }
 
+        let allow_merge = req.get_allow_batch_task_data_merge();
         let batch_outputs = self.process_batch_tasks(&mut req, &peer);
         set_tls_tracker_token(tracker);
         with_tls_tracker(|tracker| {
@@ -759,25 +852,27 @@ impl<E: Engine> Endpoint<E> {
                 tracker.req_info.begin.saturating_elapsed().as_nanos() as u64;
         });
         let fut = async move {
-            let mut res = match result_of_future {
-                Err(e) => {
-                    let output = HandlerOutcome::Ready(make_error_response(e)).into();
-                    attach_batch_task_responses(output, batch_outputs.await, tracker)
-                }
-                Ok(handle_fut) => {
-                    let (handle_res, batch_outputs) = futures::join!(handle_fut, batch_outputs);
-                    let output = handle_res
-                        .unwrap_or_else(|e| HandlerOutcome::Ready(make_error_response(e)).into());
-                    let mut res = attach_batch_task_responses(output, batch_outputs, tracker);
-                    GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-                        let exec_detail_v2 = res.mut_exec_details_v2();
-                        tracker.write_scan_detail(exec_detail_v2.mut_scan_detail_v2());
-                        tracker.merge_time_detail(exec_detail_v2.mut_time_detail_v2());
-                    });
-                    res
-                }
+            let (output, collect_top_details) = match result_of_future {
+                Err(e) => (HandlerOutcome::Ready(make_error_response(e)).into(), false),
+                Ok(handle_fut) => (
+                    handle_fut
+                        .await
+                        .unwrap_or_else(|e| HandlerOutcome::Ready(make_error_response(e)).into()),
+                    true,
+                ),
             };
-            // Attaching serializes mergeable data outside the read pool.
+            let mut res =
+                attach_batch_task_responses(output, batch_outputs, tracker, allow_merge).await;
+            if collect_top_details {
+                GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+                    let exec_detail_v2 = res.mut_exec_details_v2();
+                    tracker.write_scan_detail(exec_detail_v2.mut_scan_detail_v2());
+                    tracker.merge_time_detail(exec_detail_v2.mut_time_detail_v2());
+                });
+            }
+            // Attaching may serialize response data (see
+            // `HandlerOutcome::Mergeable`), which was not yet recorded when
+            // the response details were produced.
             GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
                 res.mut_exec_details_v2()
                     .mut_ru_v2()
@@ -789,13 +884,14 @@ impl<E: Engine> Endpoint<E> {
         Either::Right(fut)
     }
 
-    // Schedule all batched coprocessor tasks in the read pool and collect
-    // their still-unserialized outputs for endpoint resolution.
+    // Schedule all batched coprocessor tasks in the read pool and stream their
+    // outputs in completion order so `attach_batch_task_responses` can merge
+    // each one immediately.
     fn process_batch_tasks(
         &self,
         req: &mut coppb::Request,
         peer: &Option<String>,
-    ) -> impl Future<Output = Vec<BatchTaskOutput>> {
+    ) -> impl Stream<Item = BatchTaskOutput> {
         let mut batch_futs = Vec::with_capacity(req.tasks.len());
         let batch_reqs: Vec<(coppb::Request, u64)> = req
             .take_tasks()
@@ -879,7 +975,7 @@ impl<E: Engine> Endpoint<E> {
                 })),
             }
         }
-        stream::FuturesOrdered::from_iter(batch_futs).collect()
+        stream::FuturesUnordered::from_iter(batch_futs)
     }
 
     /// The real implementation of handling a stream request.
@@ -1464,6 +1560,320 @@ mod tests {
             HandlerOutcome::Ready(response) => response,
             HandlerOutcome::Mergeable { .. } => panic!("expected a ready response"),
         })
+    }
+
+    /// A mergeable result that concatenates task values.
+    #[derive(Default)]
+    struct ConcatMergeable {
+        values: Vec<u8>,
+        fail_serialize: bool,
+        merge_count: Option<Arc<atomic::AtomicUsize>>,
+    }
+
+    impl MergeableResult for ConcatMergeable {
+        fn merge(&mut self, other: Box<dyn MergeableResult>) {
+            let other = (other as Box<dyn std::any::Any>)
+                .downcast::<ConcatMergeable>()
+                .unwrap();
+            self.values.extend(other.values);
+            if let Some(merge_count) = &self.merge_count {
+                merge_count.fetch_add(1, atomic::Ordering::SeqCst);
+            }
+        }
+
+        fn into_data(mut self: Box<Self>) -> Result<Vec<u8>> {
+            if self.fail_serialize {
+                return Err(box_err!("cannot serialize"));
+            }
+            // This fixture obeys `MergeableResult`'s order-independent
+            // contract even when task completion order changes.
+            self.values.sort_unstable();
+            Ok(self.values)
+        }
+    }
+
+    fn mergeable_outcome(values: Vec<u8>, fail_serialize: bool) -> HandlerOutcome {
+        HandlerOutcome::Mergeable {
+            partial_response: coppb::Response::default(),
+            result: Box::new(ConcatMergeable {
+                values,
+                fail_serialize,
+                merge_count: None,
+            }),
+        }
+    }
+
+    fn observed_mergeable_outcome(
+        values: Vec<u8>,
+        merge_count: Arc<atomic::AtomicUsize>,
+    ) -> HandlerOutcome {
+        HandlerOutcome::Mergeable {
+            partial_response: coppb::Response::default(),
+            result: Box::new(ConcatMergeable {
+                values,
+                fail_serialize: false,
+                merge_count: Some(merge_count),
+            }),
+        }
+    }
+
+    fn mergeable_batch_output(values: Vec<u8>, fail_serialize: bool) -> BatchTaskOutput {
+        BatchTaskOutput {
+            response: coppb::StoreBatchTaskResponse::default(),
+            mergeable_result: Some(Box::new(ConcatMergeable {
+                values,
+                fail_serialize,
+                merge_count: None,
+            })),
+        }
+    }
+
+    fn attach_batch_task_responses_for_test(
+        output: HandlerOutput,
+        batch_outputs: Vec<BatchTaskOutput>,
+        tracker: TrackerToken,
+        allow_merge: bool,
+    ) -> MemoryTraceGuard<coppb::Response> {
+        block_on(attach_batch_task_responses(
+            output,
+            stream::iter(batch_outputs),
+            tracker,
+            allow_merge,
+        ))
+    }
+
+    /// Sets every detail counter to `value`, so tests catch a task's
+    /// details being dropped or mixed up while attaching.
+    fn filled_exec_details_v2(value: u64) -> kvrpcpb::ExecDetailsV2 {
+        let mut details = kvrpcpb::ExecDetailsV2::default();
+        let scan = details.mut_scan_detail_v2();
+        scan.processed_versions = value;
+        scan.processed_versions_size = value;
+        scan.total_versions = value;
+        scan.rocksdb_delete_skipped_count = value;
+        scan.rocksdb_key_skipped_count = value;
+        scan.rocksdb_block_cache_hit_count = value;
+        scan.rocksdb_block_read_count = value;
+        scan.rocksdb_block_read_byte = value;
+        scan.rocksdb_block_read_nanos = value;
+        scan.get_snapshot_nanos = value;
+        scan.read_index_propose_wait_nanos = value;
+        scan.read_index_confirm_wait_nanos = value;
+        scan.read_pool_schedule_wait_nanos = value;
+        let time = details.mut_time_detail_v2();
+        time.wait_wall_time_ns = value;
+        time.process_wall_time_ns = value;
+        time.process_suspend_wall_time_ns = value;
+        time.kv_read_wall_time_ns = value;
+        details
+    }
+
+    #[test]
+    fn test_attach_batch_task_responses_merge() {
+        // Results are merged in completion order and released before the next
+        // stream item is requested. Acknowledgements use the same order.
+        let merge_count = Arc::new(atomic::AtomicUsize::new(0));
+        let mut outcome = observed_mergeable_outcome(vec![1], merge_count.clone());
+        outcome
+            .response_mut()
+            .set_exec_details_v2(filled_exec_details_v2(1));
+        let mut batch_outputs = vec![
+            mergeable_batch_output(vec![2], false),
+            mergeable_batch_output(vec![3], false),
+        ];
+        batch_outputs[0]
+            .response
+            .set_exec_details_v2(filled_exec_details_v2(10));
+        batch_outputs[1]
+            .response
+            .set_exec_details_v2(filled_exec_details_v2(100));
+        let mut batch_outputs = batch_outputs.into_iter();
+        let first = batch_outputs.next().unwrap();
+        let second = batch_outputs.next().unwrap();
+        let observed_merge_count = merge_count.clone();
+        let completion_ordered_outputs = async_stream::stream! {
+            yield second;
+            assert_eq!(
+                observed_merge_count.load(atomic::Ordering::SeqCst),
+                1,
+                "a completed result is merged before polling the next one",
+            );
+            yield first;
+        };
+
+        let resp = block_on(attach_batch_task_responses(
+            outcome.into(),
+            completion_ordered_outputs,
+            ::tracker::INVALID_TRACKER_TOKEN,
+            true,
+        ));
+        assert_eq!(merge_count.load(atomic::Ordering::SeqCst), 2);
+        assert_eq!(resp.get_data(), &[1, 2, 3]);
+        assert!(!response_has_error(&resp));
+        assert_eq!(resp.get_exec_details_v2(), &filled_exec_details_v2(1));
+        let batch_resps = resp.get_batch_responses();
+        assert_eq!(batch_resps.len(), 2);
+        for (batch_resp, value) in batch_resps.iter().zip([100, 10]) {
+            assert!(batch_resp.get_data_merged_into_response());
+            assert!(batch_resp.get_data().is_empty());
+            assert_eq!(
+                batch_resp.get_exec_details_v2(),
+                &filled_exec_details_v2(value)
+            );
+        }
+    }
+
+    #[test]
+    fn test_attach_batch_task_responses_merge_not_allowed() {
+        // Without the client's consent every result is serialized into its
+        // own response, even when all of them are mergeable.
+        let resp = attach_batch_task_responses_for_test(
+            mergeable_outcome(vec![1], false).into(),
+            vec![mergeable_batch_output(vec![2], false)],
+            ::tracker::INVALID_TRACKER_TOKEN,
+            false,
+        );
+        assert_eq!(resp.get_data(), &[1]);
+        let batch_resps = resp.get_batch_responses();
+        assert_eq!(batch_resps.len(), 1);
+        assert!(!batch_resps[0].get_data_merged_into_response());
+        assert_eq!(batch_resps[0].get_data(), &[2]);
+    }
+
+    #[test]
+    fn test_attach_batch_task_responses_top_error_blocks_merge() {
+        // A failed top task blocks merging even when every batched
+        // task kept a mergeable result.
+        let mut outcome = mergeable_outcome(vec![1], false);
+        outcome
+            .response_mut()
+            .set_other_error("top failed".to_owned());
+        let resp = attach_batch_task_responses_for_test(
+            outcome.into(),
+            vec![mergeable_batch_output(vec![2], false)],
+            ::tracker::INVALID_TRACKER_TOKEN,
+            true,
+        );
+        assert_eq!(resp.get_other_error(), "top failed");
+        assert_eq!(resp.get_data(), &[1]);
+        let batch_resps = resp.get_batch_responses();
+        assert_eq!(batch_resps.len(), 1);
+        assert!(!batch_resps[0].get_data_merged_into_response());
+        assert_eq!(batch_resps[0].get_data(), &[2]);
+    }
+
+    #[test]
+    fn test_attach_batch_task_responses_retrace() {
+        // A mergeable result of a request without batched tasks (e.g. a
+        // plain full-sampling analyze request) is simply serialized, and
+        // the serialized data becomes traced by the guard's memory trace
+        // once it is in the response.
+        let trace = tikv_alloc::mem_trace!(test_attach_retrace);
+        let output = trace.trace_guard(mergeable_outcome(vec![1, 2, 3], false), 0);
+        let resp = attach_batch_task_responses_for_test(
+            output,
+            vec![],
+            ::tracker::INVALID_TRACKER_TOKEN,
+            true,
+        );
+        assert_eq!(resp.get_data(), &[1, 2, 3]);
+        assert!(resp.get_batch_responses().is_empty());
+        assert_eq!(trace.sum(), 3);
+        drop(resp);
+        assert_eq!(trace.sum(), 0);
+    }
+
+    #[test]
+    fn test_attach_batch_task_responses_partial_merge() {
+        // A failed task stays separate while successful mergeable tasks are
+        // merged and acknowledged. Errors and details remain on their tasks.
+        let mut outcome = mergeable_outcome(vec![1], false);
+        outcome
+            .response_mut()
+            .set_exec_details_v2(filled_exec_details_v2(1));
+        let mut failed = mergeable_batch_output(vec![3], false);
+        failed.response.set_other_error("boom".to_owned());
+        failed
+            .response
+            .set_exec_details_v2(filled_exec_details_v2(100));
+        let mut batch_outputs = vec![mergeable_batch_output(vec![2], false), failed];
+        batch_outputs[0]
+            .response
+            .set_exec_details_v2(filled_exec_details_v2(10));
+
+        let resp = attach_batch_task_responses_for_test(
+            outcome.into(),
+            batch_outputs,
+            ::tracker::INVALID_TRACKER_TOKEN,
+            true,
+        );
+        assert_eq!(resp.get_data(), &[1, 2]);
+        assert_eq!(resp.get_exec_details_v2(), &filled_exec_details_v2(1));
+        let batch_resps = resp.get_batch_responses();
+        assert_eq!(batch_resps.len(), 2);
+        assert!(batch_resps[0].get_data_merged_into_response());
+        assert!(batch_resps[0].get_data().is_empty());
+        assert_eq!(
+            batch_resps[0].get_exec_details_v2(),
+            &filled_exec_details_v2(10)
+        );
+        assert!(!batch_resps[1].get_data_merged_into_response());
+        assert_eq!(batch_resps[1].get_data(), &[3]);
+        assert_eq!(batch_resps[1].get_other_error(), "boom");
+        assert_eq!(
+            batch_resps[1].get_exec_details_v2(),
+            &filled_exec_details_v2(100)
+        );
+    }
+
+    #[test]
+    fn test_attach_batch_task_responses_serialize_errors_confined() {
+        // On the fallback path, a task whose result cannot be serialized
+        // turns into that task's error; the other tasks are unaffected.
+        let batch_outputs = vec![
+            mergeable_batch_output(vec![2], true),
+            mergeable_batch_output(vec![3], false),
+        ];
+
+        let resp = attach_batch_task_responses_for_test(
+            mergeable_outcome(vec![1], false).into(),
+            batch_outputs,
+            ::tracker::INVALID_TRACKER_TOKEN,
+            false,
+        );
+        assert_eq!(resp.get_data(), &[1]);
+        assert!(!response_has_error(&resp));
+        let batch_resps = resp.get_batch_responses();
+        assert_eq!(batch_resps.len(), 2);
+        assert!(!batch_resps[0].get_other_error().is_empty());
+        assert!(batch_resps[0].get_data().is_empty());
+        assert_eq!(batch_resps[1].get_data(), &[3]);
+
+        // A top task whose result cannot be serialized turns into an error
+        // response that still carries the batch responses.
+        let resp = attach_batch_task_responses_for_test(
+            mergeable_outcome(vec![1], true).into(),
+            vec![BatchTaskOutput {
+                response: coppb::StoreBatchTaskResponse::default(),
+                mergeable_result: None,
+            }],
+            ::tracker::INVALID_TRACKER_TOKEN,
+            true,
+        );
+        assert!(!resp.get_other_error().is_empty());
+        assert_eq!(resp.get_batch_responses().len(), 1);
+
+        // When the merged result cannot be serialized, the tasks' results
+        // are already consumed: the whole response degrades to an error
+        // without acknowledging the tasks as merged.
+        let resp = attach_batch_task_responses_for_test(
+            mergeable_outcome(vec![1], true).into(),
+            vec![mergeable_batch_output(vec![2], false)],
+            ::tracker::INVALID_TRACKER_TOKEN,
+            true,
+        );
+        assert!(!resp.get_other_error().is_empty());
+        assert!(resp.get_batch_responses().is_empty());
     }
 
     /// A streaming `RequestHandler` that always produces a fixture.
